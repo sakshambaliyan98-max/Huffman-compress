@@ -1,1 +1,552 @@
 
+// lz77huff.cpp
+// A text file compressor using LZ77 (sliding-window) + Huffman coding.
+//
+// Usage:
+//   compress.exe c <input> <output>    // compress
+//   compress.exe d <input> <output>    // decompress
+//
+// Build:
+//   g++ -O2 -std=c++17 -o lz77huff compress.cpp
+//
+// File format (compressed):
+//   [8 bytes]  magic "LZ77HUF1"
+//   [8 bytes]  uint64 original file size (for buffer preallocation / sanity)
+//   [4 bytes]  uint32 number of LZ77 tokens
+//   [Huffman tree serialization]
+//   [4 bytes]  uint32 number of bits in the encoded bit stream
+//   [bit stream bytes...]
+//
+// LZ77 tokens are encoded as a stream of "symbols" fed to the Huffman coder.
+// Each token is one of:
+//   LITERAL byte:      symbol = byte value            (0..255)
+//   MATCH  (len,dist):  symbol = 256 (ESCAPE) followed by
+//                        2 raw bytes for length (uint16, len-MIN_MATCH)
+//                        and 2 raw bytes for distance (uint16, dist-1)
+//                        -- these 4 raw bytes are NOT Huffman coded, they are
+//                        written directly to a side buffer, kept simple.
+//
+// To keep this implementation simple, readable, and easy to reason about,
+// literals AND the escape symbol go through the Huffman coder (alphabet size
+// 257), while match length/distance are stored as fixed-width raw fields in
+// a separate byte array. This keeps the Huffman tree small and the bit
+// packing logic simple, while still getting strong compression from LZ77
+// doing the heavy lifting on repeated text and Huffman compacting the
+// literal/escape distribution.
+
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <cstdlib>
+#include <string>
+#include <vector>
+#include <queue>
+#include <unordered_map>
+#include <stdexcept>
+#include <algorithm>
+#include <fstream>
+#include <sstream>
+
+// ----------------------------- Utility I/O ---------------------------------
+
+static std::vector<uint8_t> readFile(const std::string &path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) throw std::runtime_error("Cannot open input file: " + path);
+    in.seekg(0, std::ios::end);
+    std::streamsize size = in.tellg();
+    in.seekg(0, std::ios::beg);
+    std::vector<uint8_t> buf(static_cast<size_t>(size));
+    if (size > 0) {
+        if (!in.read(reinterpret_cast<char *>(buf.data()), size))
+            throw std::runtime_error("Failed reading file: " + path);
+    }
+    return buf;
+}
+
+static void writeFile(const std::string &path, const std::vector<uint8_t> &data) {
+    std::ofstream out(path, std::ios::binary);
+    if (!out) throw std::runtime_error("Cannot open output file: " + path);
+    if (!data.empty())
+        out.write(reinterpret_cast<const char *>(data.data()), static_cast<std::streamsize>(data.size()));
+}
+
+// A small helper class for writing bits MSB-first into a byte buffer.
+class BitWriter {
+public:
+    void putBit(int bit) {
+        if (bit) curByte_ |= (1u << (7 - bitPos_));
+        bitPos_++;
+        if (bitPos_ == 8) {
+            bytes_.push_back(curByte_);
+            curByte_ = 0;
+            bitPos_ = 0;
+        }
+        ++totalBits_;
+    }
+    void putBits(uint32_t value, int numBits) {
+        for (int i = numBits - 1; i >= 0; --i)
+            putBit((value >> i) & 1u);
+    }
+    void putByteRaw(uint8_t b) { putBits(b, 8); }
+    // flush pads the final partial byte with zero bits.
+    std::vector<uint8_t> &flush() {
+        if (bitPos_ != 0) {
+            bytes_.push_back(curByte_);
+            curByte_ = 0;
+            bitPos_ = 0;
+        }
+        return bytes_;
+    }
+    uint64_t totalBits() const { return totalBits_; }
+
+private:
+    std::vector<uint8_t> bytes_;
+    uint8_t curByte_ = 0;
+    int bitPos_ = 0;
+    uint64_t totalBits_ = 0;
+};
+
+// A small helper class for reading bits MSB-first from a byte buffer.
+class BitReader {
+public:
+    BitReader(const uint8_t *data, size_t sizeBytes, uint64_t totalBits)
+        : data_(data), sizeBytes_(sizeBytes), totalBits_(totalBits) {}
+
+    int getBit() {
+        if (bitsRead_ >= totalBits_) throw std::runtime_error("Bit stream underflow");
+        size_t byteIdx = bitsRead_ / 8;
+        int bitIdx = static_cast<int>(bitsRead_ % 8);
+        int bit = (data_[byteIdx] >> (7 - bitIdx)) & 1;
+        ++bitsRead_;
+        return bit;
+    }
+    uint32_t getBits(int numBits) {
+        uint32_t v = 0;
+        for (int i = 0; i < numBits; ++i) v = (v << 1) | getBit();
+        return v;
+    }
+    uint8_t getByteRaw() { return static_cast<uint8_t>(getBits(8)); }
+
+private:
+    const uint8_t *data_;
+    size_t sizeBytes_;
+    uint64_t totalBits_;
+    uint64_t bitsRead_ = 0;
+};
+
+// ----------------------------- LZ77 -----------------------------------------
+//
+// Classic sliding-window LZ77 with a hash-chain match finder for speed.
+// WINDOW_SIZE = size of the search buffer (history)
+// MIN_MATCH   = shortest match worth encoding
+// MAX_MATCH   = longest match length representable (uint16 field, offset by MIN_MATCH)
+
+static const int WINDOW_SIZE = 32768;   // 32 KB window, like classic DEFLATE
+static const int MIN_MATCH = 4;
+static const int MAX_MATCH = 4 + 65535; // limited by 16-bit length field
+static const int HASH_BITS = 15;
+static const int HASH_SIZE = 1 << HASH_BITS;
+static const int MAX_CHAIN = 128; // search depth cap, trades ratio vs speed
+
+struct Token {
+    bool isMatch;
+    uint8_t literal;   // valid if !isMatch
+    uint32_t length;   // valid if isMatch (actual length, >= MIN_MATCH)
+    uint32_t distance; // valid if isMatch (actual distance, >= 1)
+};
+
+static inline uint32_t hash4(const uint8_t *p) {
+    uint32_t v = (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) | uint32_t(p[3]);
+    // Fibonacci-style hash mix down to HASH_BITS
+    return (v * 2654435761u) >> (32 - HASH_BITS);
+}
+
+static std::vector<Token> lz77Compress(const std::vector<uint8_t> &data) {
+    std::vector<Token> tokens;
+    const size_t n = data.size();
+    if (n == 0) return tokens;
+
+    std::vector<int32_t> head(HASH_SIZE, -1);
+    std::vector<int32_t> prevChain(n, -1);
+
+    size_t i = 0;
+    while (i < n) {
+        int bestLen = 0;
+        size_t bestDist = 0;
+
+        if (i + MIN_MATCH <= n) {
+            uint32_t h = hash4(&data[i]);
+            int32_t cand = head[h];
+            int chainLen = 0;
+            size_t windowStart = (i > (size_t)WINDOW_SIZE) ? (i - WINDOW_SIZE) : 0;
+
+            while (cand >= 0 && (size_t)cand >= windowStart && chainLen < MAX_CHAIN) {
+                // compare
+                size_t maxPossible = std::min<size_t>(MAX_MATCH, n - i);
+                size_t len = 0;
+                while (len < maxPossible && data[cand + len] == data[i + len]) ++len;
+
+                if ((int)len > bestLen) {
+                    bestLen = (int)len;
+                    bestDist = i - (size_t)cand;
+                    if (bestLen >= MAX_MATCH) break;
+                }
+                cand = prevChain[cand];
+                ++chainLen;
+            }
+        }
+
+        if (bestLen >= MIN_MATCH) {
+            Token t;
+            t.isMatch = true;
+            t.length = (uint32_t)bestLen;
+            t.distance = (uint32_t)bestDist;
+            tokens.push_back(t);
+
+            // Insert hash entries for all positions covered by the match
+            // (bounded to keep it fast: insert every position, standard practice)
+            size_t end = i + bestLen;
+            for (; i < end && i + MIN_MATCH <= n; ++i) {
+                uint32_t h = hash4(&data[i]);
+                prevChain[i] = head[h];
+                head[h] = (int32_t)i;
+            }
+            // if match ran past the point where we can hash (near EOF), just advance
+            if (i < end) i = end;
+        } else {
+            Token t;
+            t.isMatch = false;
+            t.literal = data[i];
+            tokens.push_back(t);
+
+            if (i + MIN_MATCH <= n) {
+                uint32_t h = hash4(&data[i]);
+                prevChain[i] = head[h];
+                head[h] = (int32_t)i;
+            }
+            ++i;
+        }
+    }
+
+    return tokens;
+}
+
+static std::vector<uint8_t> lz77Decompress(const std::vector<Token> &tokens, uint64_t originalSize) {
+    std::vector<uint8_t> out;
+    out.reserve(originalSize);
+    for (const auto &t : tokens) {
+        if (t.isMatch) {
+            size_t start = out.size() - t.distance;
+            for (uint32_t k = 0; k < t.length; ++k)
+                out.push_back(out[start + k]);
+        } else {
+            out.push_back(t.literal);
+        }
+    }
+    return out;
+}
+
+// ----------------------------- Huffman --------------------------------------
+//
+// Alphabet: 0..255 = literal byte values, 256 = ESCAPE (marks a match token
+// follows, with raw length/distance fields appended out-of-band).
+// Standard canonical-free Huffman: build tree from frequencies, serialize by
+// writing the tree structure itself (simple recursive pre-order encoding),
+// which is easy to implement correctly and works fine for typical text files.
+
+static const int ALPHABET_SIZE = 257; // 0..255 literals + 256 escape
+static const int ESCAPE_SYM = 256;
+
+struct HuffNode {
+    uint64_t freq = 0;
+    int symbol = -1; // -1 for internal nodes
+    HuffNode *left = nullptr;
+    HuffNode *right = nullptr;
+};
+
+struct HuffNodeCmp {
+    bool operator()(const HuffNode *a, const HuffNode *b) const {
+        return a->freq > b->freq; // min-heap
+    }
+};
+
+static void freeTree(HuffNode *n) {
+    if (!n) return;
+    freeTree(n->left);
+    freeTree(n->right);
+    delete n;
+}
+
+static HuffNode *buildHuffmanTree(const uint64_t freq[ALPHABET_SIZE]) {
+    std::priority_queue<HuffNode *, std::vector<HuffNode *>, HuffNodeCmp> pq;
+    int distinctSymbols = 0;
+    for (int s = 0; s < ALPHABET_SIZE; ++s) {
+        if (freq[s] > 0) {
+            HuffNode *leaf = new HuffNode();
+            leaf->freq = freq[s];
+            leaf->symbol = s;
+            pq.push(leaf);
+            ++distinctSymbols;
+        }
+    }
+
+    if (distinctSymbols == 0) {
+        // Degenerate: empty input. Return a dummy single-node tree.
+        HuffNode *leaf = new HuffNode();
+        leaf->freq = 1;
+        leaf->symbol = 0;
+        return leaf;
+    }
+    if (distinctSymbols == 1) {
+        // Only one symbol type present: still need a valid code (bit "0").
+        HuffNode *only = pq.top(); pq.pop();
+        HuffNode *root = new HuffNode();
+        root->freq = only->freq;
+        root->left = only;
+        root->right = nullptr;
+        return root;
+    }
+
+    while (pq.size() > 1) {
+        HuffNode *a = pq.top(); pq.pop();
+        HuffNode *b = pq.top(); pq.pop();
+        HuffNode *parent = new HuffNode();
+        parent->freq = a->freq + b->freq;
+        parent->left = a;
+        parent->right = b;
+        pq.push(parent);
+    }
+    return pq.top();
+}
+
+static void buildCodes(HuffNode *node, uint32_t code, int depth,
+                        std::unordered_map<int, std::pair<uint32_t, int>> &table) {
+    if (!node) return;
+    if (node->symbol != -1) {
+        // depth could be 0 if there's literally one node total (never happens
+        // here because degenerate case wraps it under a root already).
+        table[node->symbol] = {code, std::max(depth, 1)};
+        return;
+    }
+    buildCodes(node->left, (code << 1) | 0u, depth + 1, table);
+    buildCodes(node->right, (code << 1) | 1u, depth + 1, table);
+}
+
+// Serialize tree with a simple recursive scheme:
+//   internal node -> write bit 0, then recurse left, recurse right
+//   leaf node     -> write bit 1, then write 9 bits of symbol (0..256)
+static void serializeTree(HuffNode *node, BitWriter &bw) {
+    if (node->symbol != -1) {
+        bw.putBit(1);
+        bw.putBits((uint32_t)node->symbol, 9); // 0..256 fits in 9 bits
+        return;
+    }
+    bw.putBit(0);
+    // left always present by construction; right may be null only in the
+    // single-symbol-total degenerate wrapper case.
+    serializeTree(node->left, bw);
+    if (node->right) {
+        bw.putBit(1); // marker: right child present
+        serializeTree(node->right, bw);
+    } else {
+        bw.putBit(0); // marker: no right child
+    }
+}
+
+static HuffNode *deserializeTree(BitReader &br) {
+    int isLeaf = br.getBit();
+    HuffNode *node = new HuffNode();
+    if (isLeaf) {
+        node->symbol = (int)br.getBits(9);
+        return node;
+    }
+    node->left = deserializeTree(br);
+    int hasRight = br.getBit();
+    if (hasRight) {
+        node->right = deserializeTree(br);
+    } else {
+        node->right = nullptr;
+    }
+    return node;
+}
+
+// ----------------------------- Compress / Decompress ------------------------
+
+static const char MAGIC[8] = {'L', 'Z', '7', '7', 'H', 'U', 'F', '1'};
+
+static void putU64(std::vector<uint8_t> &out, uint64_t v) {
+    for (int i = 0; i < 8; ++i) out.push_back((uint8_t)((v >> (8 * i)) & 0xFF));
+}
+static void putU32(std::vector<uint8_t> &out, uint32_t v) {
+    for (int i = 0; i < 4; ++i) out.push_back((uint8_t)((v >> (8 * i)) & 0xFF));
+}
+static uint64_t getU64(const uint8_t *p) {
+    uint64_t v = 0;
+    for (int i = 0; i < 8; ++i) v |= (uint64_t)p[i] << (8 * i);
+    return v;
+}
+static uint32_t getU32(const uint8_t *p) {
+    uint32_t v = 0;
+    for (int i = 0; i < 4; ++i) v |= (uint32_t)p[i] << (8 * i);
+    return v;
+}
+
+static void compressFile(const std::string &inPath, const std::string &outPath) {
+    std::vector<uint8_t> input = readFile(inPath);
+    std::vector<Token> tokens = lz77Compress(input);
+
+    // Build frequency table for Huffman alphabet (literals + escape symbol).
+    uint64_t freq[ALPHABET_SIZE] = {0};
+    for (const auto &t : tokens) {
+        if (t.isMatch) freq[ESCAPE_SYM]++;
+        else freq[t.literal]++;
+    }
+
+    HuffNode *root = buildHuffmanTree(freq);
+    std::unordered_map<int, std::pair<uint32_t, int>> codeTable;
+    buildCodes(root, 0, 0, codeTable);
+
+    // Side buffer for raw length/distance fields of match tokens.
+    std::vector<uint8_t> sideBuffer;
+    sideBuffer.reserve(tokens.size() * 4);
+
+    BitWriter bw;
+    // Serialize the tree first into the bit stream.
+    serializeTree(root, bw);
+
+    for (const auto &t : tokens) {
+        int sym = t.isMatch ? ESCAPE_SYM : (int)t.literal;
+        auto &code = codeTable.at(sym);
+        bw.putBits(code.first, code.second);
+        if (t.isMatch) {
+            uint32_t lenField = t.length - MIN_MATCH; // fits in 16 bits given MAX_MATCH
+            uint32_t distField = t.distance - 1;       // fits in 16 bits given WINDOW_SIZE
+            sideBuffer.push_back((uint8_t)(lenField & 0xFF));
+            sideBuffer.push_back((uint8_t)((lenField >> 8) & 0xFF));
+            sideBuffer.push_back((uint8_t)(distField & 0xFF));
+            sideBuffer.push_back((uint8_t)((distField >> 8) & 0xFF));
+        }
+    }
+
+    uint64_t totalBits = bw.totalBits();
+    std::vector<uint8_t> &bitBytes = bw.flush();
+
+    freeTree(root);
+
+    // Assemble final output.
+    std::vector<uint8_t> out;
+    out.reserve(64 + bitBytes.size() + sideBuffer.size());
+    for (char c : MAGIC) out.push_back((uint8_t)c);
+    putU64(out, (uint64_t)input.size());
+    putU32(out, (uint32_t)tokens.size());
+    putU64(out, totalBits);
+    putU32(out, (uint32_t)bitBytes.size());
+    out.insert(out.end(), bitBytes.begin(), bitBytes.end());
+    putU32(out, (uint32_t)sideBuffer.size());
+    out.insert(out.end(), sideBuffer.begin(), sideBuffer.end());
+
+    writeFile(outPath, out);
+
+    // Report stats to the user.
+    double ratio = input.empty() ? 0.0 : (100.0 * (1.0 - (double)out.size() / (double)input.size()));
+    std::fprintf(stderr, "Input:  %zu bytes\n", input.size());
+    std::fprintf(stderr, "Output: %zu bytes\n", out.size());
+    std::fprintf(stderr, "Tokens: %zu (literals+matches)\n", tokens.size());
+    std::fprintf(stderr, "Space saved: %.2f%%\n", ratio);
+}
+
+static void decompressFile(const std::string &inPath, const std::string &outPath) {
+    std::vector<uint8_t> in = readFile(inPath);
+    if (in.size() < 8 || std::memcmp(in.data(), MAGIC, 8) != 0)
+        throw std::runtime_error("Bad file format / magic mismatch");
+
+    size_t pos = 8;
+    uint64_t originalSize = getU64(&in[pos]); pos += 8;
+    uint32_t numTokens = getU32(&in[pos]); pos += 4;
+    uint64_t totalBits = getU64(&in[pos]); pos += 8;
+    uint32_t bitBytesLen = getU32(&in[pos]); pos += 4;
+
+    const uint8_t *bitBytes = &in[pos];
+    pos += bitBytesLen;
+
+    uint32_t sideLen = getU32(&in[pos]); pos += 4;
+    const uint8_t *sideBuffer = &in[pos];
+    pos += sideLen;
+
+    BitReader br(bitBytes, bitBytesLen, totalBits);
+    HuffNode *root = deserializeTree(br);
+
+    std::vector<Token> tokens;
+    tokens.reserve(numTokens);
+    size_t sideIdx = 0;
+
+    for (uint32_t k = 0; k < numTokens; ++k) {
+        HuffNode *node = root;
+        // Handle degenerate single-symbol tree: root->left is leaf, root->right null.
+        while (node->symbol == -1) {
+            int bit = br.getBit();
+            node = bit ? node->right : node->left;
+            if (!node) throw std::runtime_error("Corrupt Huffman stream");
+        }
+        int sym = node->symbol;
+        Token t;
+        if (sym == ESCAPE_SYM) {
+            t.isMatch = true;
+            uint32_t lenField = (uint32_t)sideBuffer[sideIdx] | ((uint32_t)sideBuffer[sideIdx + 1] << 8);
+            uint32_t distField = (uint32_t)sideBuffer[sideIdx + 2] | ((uint32_t)sideBuffer[sideIdx + 3] << 8);
+            sideIdx += 4;
+            t.length = lenField + MIN_MATCH;
+            t.distance = distField + 1;
+        } else {
+            t.isMatch = false;
+            t.literal = (uint8_t)sym;
+        }
+        tokens.push_back(t);
+    }
+
+    freeTree(root);
+
+    std::vector<uint8_t> output = lz77Decompress(tokens, originalSize);
+    if (output.size() != originalSize)
+        throw std::runtime_error("Decompressed size mismatch - file may be corrupt");
+
+    writeFile(outPath, output);
+    std::fprintf(stderr, "Decompressed %zu bytes -> %s\n", output.size(), outPath.c_str());
+}
+
+// ----------------------------- main -----------------------------------------
+
+static void printUsage(const char *prog) {
+    std::fprintf(stderr,
+        "LZ77 + Huffman file compressor\n"
+        "Usage:\n"
+        "  %s c <input> <output>   Compress input into output\n"
+        "  %s d <input> <output>   Decompress input into output\n",
+        prog, prog);
+}
+
+int main(int argc, char **argv) {
+    if (argc != 4) {
+        printUsage(argv[0]);
+        return 1;
+    }
+    std::string mode = argv[1];
+    std::string inPath = argv[2];
+    std::string outPath = argv[3];
+
+    try {
+        if (mode == "c") {
+            compressFile(inPath, outPath);
+        } else if (mode == "d") {
+            decompressFile(inPath, outPath);
+        } else {
+            printUsage(argv[0]);
+            return 1;
+        }
+    } catch (const std::exception &e) {
+        std::fprintf(stderr, "Error: %s\n", e.what());
+        return 1;
+    }
+
+    return 0;
+}
